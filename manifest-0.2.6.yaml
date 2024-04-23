@@ -1,0 +1,235 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    control-plane: binauthz-controller
+  name: binauthz-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: binauthz-admin
+  namespace: binauthz-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  creationTimestamp: null
+  labels: null
+  name: binauthz-role
+  namespace: binauthz-system
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  creationTimestamp: null
+  name: binauthz-role
+rules:
+- apiGroups:
+  - '*'
+  resources:
+  - '*'
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - admissionregistration.k8s.io
+  resourceNames:
+  - binauthz-validating-webhook-configuration
+  resources:
+  - validatingwebhookconfigurations
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: binauthz-rolebinding
+  namespace: binauthz-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: binauthz-role
+subjects:
+- kind: ServiceAccount
+  name: binauthz-admin
+  namespace: binauthz-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: binauthz-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: binauthz-role
+subjects:
+- kind: ServiceAccount
+  name: binauthz-admin
+  namespace: binauthz-system
+---
+apiVersion: v1
+data:
+  config: |
+    {
+      "type": "external_account",
+      "audience": "identitynamespace:db-dev-s5ke-fabric-ocp-dev.svc.id.goog:https://gkehub.googleapis.com/projects/db-dev-s5ke-fabric-ocp-dev/locations/global/memberships/ukgcpe2",
+      "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+      "token_url": "https://sts.googleapis.com/v1/token",
+      "credential_source": {
+        "file": "/var/run/secrets/tokens/gcp-ksa/token"
+      }
+    }
+kind: ConfigMap
+metadata:
+  name: binauthz-wi-config
+  namespace: binauthz-system
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: binauthz-tls
+  namespace: binauthz-system
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: binauthz
+  namespace: binauthz-system
+spec:
+  ports:
+  - port: 443
+    targetPort: 443
+  selector:
+    control-plane: binauthz-controller
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    control-plane: binauthz-controller
+  name: binauthz-module-deployment
+  namespace: binauthz-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      control-plane: binauthz-controller
+  template:
+    metadata:
+      labels:
+        control-plane: binauthz-controller
+    spec:
+      containers:
+      - args:
+        - -secretname=binauthz-tls
+        - -vwhname=binauthz-validating-webhook-configuration
+        - -servicename=binauthz
+        - -namespace=binauthz-system
+        - -alsologtostderr
+        env:
+        - name: GOOGLE_APPLICATION_CREDENTIALS
+          value: /var/run/secrets/tokens/gcp-ksa/google-application-credentials.json
+        image: gcr.io/anthos-baremetal-release/binauthz-controller:0.2.6
+        imagePullPolicy: Always
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 9090
+        name: binauthz-module
+        ports:
+        - containerPort: 9090
+          name: healthz
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 9090
+        volumeMounts:
+        - mountPath: /etc/binauthz/tls
+          name: binauthz-tls
+          readOnly: true
+        - mountPath: /var/run/secrets/tokens/gcp-ksa
+          name: gcp-ksa
+          readOnly: true
+      serviceAccountName: binauthz-admin
+      terminationGracePeriodSeconds: 60
+      volumes:
+      - name: binauthz-tls
+        secret:
+          secretName: binauthz-tls
+      - name: gcp-ksa
+        projected:
+          defaultMode: 420
+          sources:
+          - serviceAccountToken:
+              audience: db-dev-s5ke-fabric-ocp-dev.svc.id.goog
+              expirationSeconds: 172800
+              path: token
+          - configMap:
+              items:
+              - key: config
+                path: google-application-credentials.json
+              name: binauthz-wi-config
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: binauthz-validating-webhook-configuration
+webhooks:
+- admissionReviewVersions:
+  - v1beta1
+  clientConfig:
+    caBundle: Cg==
+    service:
+      name: binauthz
+      namespace: binauthz-system
+      path: /admit
+  failurePolicy: Ignore
+  name: binaryauthorization.googleapis.com
+  namespaceSelector:
+    matchExpressions:
+    - key: control-plane
+      operator: DoesNotExist
+  objectSelector:
+    matchExpressions:
+    - key: image-policy.k8s.io/break-glass
+      operator: NotIn
+      values:
+      - "true"
+    - key: alpha.image-policy.k8s.io/break-glass
+      operator: NotIn
+      values:
+      - "true"
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - pods
+    - pods/ephemeralcontainers
+  sideEffects: None
